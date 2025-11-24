@@ -2,7 +2,7 @@ import streamlit as st
 import folium
 from streamlit_folium import st_folium
 from geopy.geocoders import Nominatim
-from scipy.optimize import least_squares
+from scipy.optimize import differential_evolution
 import math
 from PIL import Image
 import numpy as np
@@ -37,64 +37,74 @@ with col_logo:
     except:
         pass
 with col_title:
-    st.title("Chope ton Bat Ultimate")
-st.markdown("### Système de Triangulation (Ultimate 3D)")
+    st.title("Chope ton Bat")
+st.markdown("### Système de Triangulation (Moteur Ultimate)")
 
-# --- MOTEUR MATHÉMATIQUE PRO (MOINDRES CARRÉS) ---
+# --- MOTEUR MATHÉMATIQUE GLOBAL (EVOLUTION DIFFÉRENTIELLE) ---
 
-def haversine_np(lon1, lat1, lon2, lat2):
-    """
-    Calcule la distance Haversine de manière vectorisée (compatible numpy)
-    """
-    lon1, lat1, lon2, lat2 = map(np.radians, [lon1, lat1, lon2, lat2])
-    dlon = lon2 - lon1
-    dlat = lat2 - lat1
-    a = np.sin(dlat/2.0)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon/2.0)**2
-    c = 2 * np.arcsin(np.sqrt(a))
-    km = 6371 * c
-    return km
+def haversine_scalar(lat1, lon1, lat2, lon2):
+    """Distance précise sur une sphère (Haversine)"""
+    R = 6371
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
 
-def residuals(guess, points, radii):
+def error_function_global(coords, points, radii):
     """
-    Fonction de résidus pour least_squares.
-    Calcule la différence entre la distance actuelle et le rayon cible pour chaque point.
-    L'optimiseur cherche à rendre ces différences aussi proches de 0 que possible.
+    Fonction d'erreur pour l'évolution différentielle.
+    coords: [lat, lon] candidat
     """
-    lat_guess, lon_guess = guess
-    res = []
+    lat, lon = coords
+    total_error = 0
+    
     for i in range(len(points)):
-        # points[i] est (lat, lon)
-        dist_calc = haversine_np(lon_guess, lat_guess, points[i][1], points[i][0])
-        # On veut que (distance calculée - rayon donné) soit = 0
-        res.append(dist_calc - radii[i])
-    return np.array(res)
+        p_lat, p_lon = points[i]
+        target_radius = radii[i]
+        
+        # Distance calculée entre le point testé et l'antenne
+        dist = haversine_scalar(lat, lon, p_lat, p_lon)
+        
+        # On ajoute l'erreur au carré
+        total_error += (dist - target_radius)**2
+        
+    return total_error
 
-def solve_trilateration_robust(p1, r1, p2, r2, p3, r3):
+def solve_trilateration_global(p1, r1, p2, r2, p3, r3):
     points = [p1, p2, p3]
     radii = [r1, r2, r3]
     
-    # 1. Point de départ approximatif (moyenne simple)
-    initial_guess = [
-        np.mean([p[0] for p in points]),
-        np.mean([p[1] for p in points])
+    # 1. Définir la ZONE DE RECHERCHE (Bounding Box)
+    # On prend les lats/lons min et max des points et on ajoute une marge
+    # pour être sûr que l'intersection est dedans.
+    lats = [p[0] for p in points]
+    lons = [p[1] for p in points]
+    max_dist = max(radii) * 2 / 111.0 # Conversion approx km vers degrés pour la marge
+    
+    bounds = [
+        (min(lats) - max_dist, max(lats) + max_dist), # Latitude min/max
+        (min(lons) - max_dist, max(lons) + max_dist)  # Longitude min/max
     ]
 
-    # 2. Résolution par Moindres Carrés Non-Linéaires (Trust Region Reflective)
-    # C'est la méthode la plus robuste pour ce type de problème géométrique.
-    result = least_squares(
-        residuals, 
-        initial_guess, 
+    # 2. Algorithme d'Évolution Différentielle
+    # Il "parachutes" des points partout dans la zone et fait survivre les meilleurs.
+    result = differential_evolution(
+        error_function_global,
+        bounds,
         args=(points, radii),
-        method='trf', # Très robuste pour les problèmes bornés
-        loss='soft_l1', # Résistant aux données aberrantes
-        ftol=1e-8,
-        xtol=1e-8
+        strategy='best1bin',
+        maxiter=1000,
+        popsize=15,
+        tol=1e-7,
+        mutation=(0.5, 1),
+        recombination=0.7
     )
     
     return result.x[0], result.x[1]
 
 def get_coords(address):
-    geolocator = Nominatim(user_agent="triangulation_app_hades_pro")
+    geolocator = Nominatim(user_agent="triangulation_app_hades_evo")
     try:
         location = geolocator.geocode(address, timeout=10)
         return (location.latitude, location.longitude) if location else None
@@ -120,14 +130,14 @@ d3 = c6.number_input("Dist 3 (km)", min_value=0.1, format="%.2f")
 # --- EXECUTION ---
 if st.button("LANCER LA TRIANGULATION"):
     if a1 and a2 and a3 and d1 and d2 and d3:
-        with st.spinner('Calcul de convergence optimal...'):
+        with st.spinner('Scan global de la zone (Differential Evolution)...'):
             p1 = get_coords(a1)
             p2 = get_coords(a2)
             p3 = get_coords(a3)
 
             if p1 and p2 and p3:
-                # Appel du solveur robuste
-                final_pos = solve_trilateration_robust(p1, d1, p2, d2, p3, d3)
+                # Appel du solveur global
+                final_pos = solve_trilateration_global(p1, d1, p2, d2, p3, d3)
                 
                 st.session_state.resultat = final_pos
                 st.session_state.marge_erreur = marge
@@ -143,7 +153,7 @@ if st.session_state.resultat is not None:
     pts = st.session_state.coords_points
     m_err = st.session_state.marge_erreur
     
-    st.success(f"📍 Point de convergence optimal : {res[0]:.5f}, {res[1]:.5f}")
+    st.success(f"📍 Meilleure convergence trouvée : {res[0]:.5f}, {res[1]:.5f}")
     
     # SETUP MAPBOX VECTOR
     tile_layer = "OpenStreetMap"
@@ -151,7 +161,7 @@ if st.session_state.resultat is not None:
     
     if "MAPBOX_TOKEN" in st.secrets:
         token = st.secrets["MAPBOX_TOKEN"]
-        # Utilisation du style "Streets" vectoriel (très propre) au lieu du satellite
+        # Style Vectoriel Streets
         tile_layer = f"https://api.mapbox.com/styles/v1/mapbox/streets-v12/tiles/{{z}}/{{x}}/{{y}}?access_token={token}"
         attr = "Mapbox Streets"
     
@@ -167,28 +177,28 @@ if st.session_state.resultat is not None:
 
     # --- ÉLÉMENTS GRAPHIQUES ---
     for i, (pt, dist) in enumerate(pts):
-        # Marge (Pointillés Gris)
-        folium.Circle(pt, radius=(dist-m_err)*1000, color="#555555", weight=1, dash_array='5,5', fill=False, opacity=0.6).add_to(m)
-        folium.Circle(pt, radius=(dist+m_err)*1000, color="#555555", weight=1, dash_array='5,5', fill=False, opacity=0.6).add_to(m)
+        # Marge (Gris)
+        folium.Circle(pt, radius=(dist-m_err)*1000, color="#666", weight=1, dash_array='5,5', fill=False, opacity=0.5).add_to(m)
+        folium.Circle(pt, radius=(dist+m_err)*1000, color="#666", weight=1, dash_array='5,5', fill=False, opacity=0.5).add_to(m)
         
-        # Cercle exact (Bleu vif)
-        folium.Circle(pt, radius=dist*1000, color="#007cbf", weight=2, fill=False).add_to(m)
-        # Marqueur numéroté
-        folium.Marker(pt, icon=folium.DivIcon(html=f"""<div style="font-family: sans-serif; color: white; background-color: #007cbf; width: 20px; height: 20px; border-radius: 50%; text-align: center; line-height: 20px;">{i+1}</div>""")).add_to(m)
+        # Cercle exact (Bleu)
+        folium.Circle(pt, radius=dist*1000, color="#2196F3", weight=2, fill=False).add_to(m)
+        
+        # Marqueur
+        folium.Marker(pt, tooltip=f"Repère {i+1}").add_to(m)
 
 
-    # CIBLE (Rouge vif avec halo)
-    folium.Circle(res, radius=m_err*1000, color="red", weight=1, fill=True, fill_color="#ff0000", fill_opacity=0.2).add_to(m)
+    # CIBLE (Rouge avec Pulsation simulée par 2 cercles)
+    folium.Circle(res, radius=m_err*1000, color="red", weight=1, fill=True, fill_color="#ff0000", fill_opacity=0.3).add_to(m)
+    folium.Circle(res, radius=(m_err*1000)/3, color="red", weight=2, fill=True, fill_color="#ff0000", fill_opacity=0.8).add_to(m)
     folium.Marker(res, icon=folium.Icon(color="red", icon="crosshairs", prefix="fa")).add_to(m)
 
-    # --- EFFET 3D (Inclinaison forcée) ---
+    # --- EFFET 3D ---
     m.get_root().html.add_child(folium.Element("""
         <script>
             document.addEventListener('DOMContentLoaded', function() {
                 var map_instance = %s;
-                // Inclinaison à 55 degrés pour l'effet 3D
-                map_instance.getMap().setPitch(55);
-                // Orientation vers le Nord
+                map_instance.getMap().setPitch(60); // Inclinaison max
                 map_instance.getMap().setBearing(0);
             });
         </script>
