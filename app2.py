@@ -2,13 +2,15 @@ import streamlit as st
 import folium
 from streamlit_folium import st_folium
 from geopy.geocoders import Nominatim
+from scipy.optimize import minimize
 import math
 from PIL import Image
+import numpy as np
 
-# --- CONFIGURATION DE LA PAGE ---
-st.set_page_config(page_title="Chope ton Bat", page_icon="🦇", layout="centered")
+# --- CONFIGURATION ---
+st.set_page_config(page_title="Chope ton Bat V2", page_icon="🦇", layout="centered")
 
-# Style CSS
+# CSS
 st.markdown("""
     <style>
     .stButton>button {
@@ -21,169 +23,166 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# --- GESTION DE LA MÉMOIRE ---
-if 'resultat' not in st.session_state:
-    st.session_state.resultat = None
-if 'coords_points' not in st.session_state:
-    st.session_state.coords_points = None
-if 'marge_erreur' not in st.session_state:
-    st.session_state.marge_erreur = 1.0
+# --- SESSION ---
+if 'resultat' not in st.session_state: st.session_state.resultat = None
+if 'coords_points' not in st.session_state: st.session_state.coords_points = None
+if 'marge_erreur' not in st.session_state: st.session_state.marge_erreur = 1.0
 
-# --- EN-TÊTE ---
+# --- HEADER ---
 col_logo, col_title = st.columns([1, 4])
 with col_logo:
     try:
-        image = Image.open("hades.png") 
+        image = Image.open("hades.png")
         st.image(image, width=100)
-    except FileNotFoundError:
-        st.warning("Logo?")
+    except:
+        pass
 with col_title:
-    st.title("Chope ton Bat")
-st.markdown("### Système de Triangulation Tactique")
+    st.title("Chope ton Bat Ultimate Edition")
+st.markdown("### Système de Triangulation Tactique (Moteur SciPy)")
 
-# --- MOTEUR MATHÉMATIQUE ---
+# --- MOTEUR MATHÉMATIQUE SCIENTIFIQUE ---
 
-def haversine_distance(lat1, lon1, lat2, lon2):
+def earth_dist(lat1, lon1, lat2, lon2):
+    """Distance précise sur une sphère (Haversine) pour l'optimiseur"""
     R = 6371
-    dlat = math.radians(lat2 - lat1)
-    dlon = math.radians(lon2 - lon1)
-    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
-    return R * c
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
 
-def trilateration_optimize(p1, r1, p2, r2, p3, r3):
-    lat = (p1[0] + p2[0] + p3[0]) / 3
-    lon = (p1[1] + p2[1] + p3[1]) / 3
+def error_function(guess, points, radii):
+    """Fonction que l'IA doit réduire à 0"""
+    lat, lon = guess
+    err = 0
+    for i in range(3):
+        # On calcule la différence entre la distance réelle et le rayon voulu
+        dist_calc = earth_dist(lat, lon, points[i][0], points[i][1])
+        err += (dist_calc - radii[i])**2
+    return err
+
+def solve_trilateration(p1, r1, p2, r2, p3, r3):
+    # 1. Point de départ intelligent (Barycentre pondéré)
+    # On démarre la recherche au milieu des 3 points
+    initial_guess = [
+        (p1[0] + p2[0] + p3[0]) / 3,
+        (p1[1] + p2[1] + p3[1]) / 3
+    ]
     
-    step_size = 1.0
-    min_step = 0.00001
+    points = [p1, p2, p3]
+    radii = [r1, r2, r3]
+
+    # 2. Résolution par méthode de Nelder-Mead (Robuste pour la géométrie non-linéaire)
+    result = minimize(
+        error_function, 
+        initial_guess, 
+        args=(points, radii),
+        method='Nelder-Mead',
+        tol=1e-6
+    )
     
-    for i in range(2000):
-        d1 = haversine_distance(lat, lon, p1[0], p1[1])
-        d2 = haversine_distance(lat, lon, p2[0], p2[1])
-        d3 = haversine_distance(lat, lon, p3[0], p3[1])
-        
-        current_error = (d1 - r1)**2 + (d2 - r2)**2 + (d3 - r3)**2
-        
-        if step_size < min_step:
-            break
-            
-        best_lat, best_lon = lat, lon
-        best_err = current_error
-        found_better = False
-        
-        moves = [(step_size, 0), (-step_size, 0), (0, step_size), (0, -step_size)]
-        
-        for d_lat, d_lon in moves:
-            test_lat = lat + d_lat
-            test_lon = lon + d_lon
-            td1 = haversine_distance(test_lat, test_lon, p1[0], p1[1])
-            td2 = haversine_distance(test_lat, test_lon, p2[0], p2[1])
-            td3 = haversine_distance(test_lat, test_lon, p3[0], p3[1])
-            test_err = (td1 - r1)**2 + (td2 - r2)**2 + (td3 - r3)**2
-            
-            if test_err < best_err:
-                best_lat, best_lon = test_lat, test_lon
-                best_err = test_err
-                found_better = True
-
-        if found_better:
-            lat, lon = best_lat, best_lon
-        else:
-            step_size /= 2.0
-
-    return lat, lon
+    return result.x[0], result.x[1]
 
 def get_coords(address):
-    geolocator = Nominatim(user_agent="triangulation_app_hades_v4")
+    geolocator = Nominatim(user_agent="triangulation_app_hades_final")
     try:
         location = geolocator.geocode(address, timeout=10)
-        if location:
-            return location.latitude, location.longitude
-        else:
-            return None
+        return (location.latitude, location.longitude) if location else None
     except:
         return None
 
-# --- FORMULAIRE ---
+# --- UI ---
 st.markdown("#### Paramètres")
-marge = st.slider("Marge d'erreur visuelle (km)", 0.1, 5.0, 1.0, 0.1)
+marge = st.slider("Marge d'erreur visuelle (km)", 0.1, 10.0, 1.0, 0.1)
 
-col1, col2 = st.columns([3, 1])
-addr1 = col1.text_input("Adresse 1", placeholder="Ex: Tour Eiffel, Paris")
-dist1 = col2.number_input("Dist 1 (km)", min_value=0.1, format="%.2f")
+c1, c2 = st.columns([3, 1])
+a1 = c1.text_input("Adresse 1")
+d1 = c2.number_input("Dist 1 (km)", min_value=0.1, format="%.2f")
 
-col3, col4 = st.columns([3, 1])
-addr2 = col3.text_input("Adresse 2")
-dist2 = col4.number_input("Dist 2 (km)", min_value=0.1, format="%.2f")
+c3, c4 = st.columns([3, 1])
+a2 = c3.text_input("Adresse 2")
+d2 = c4.number_input("Dist 2 (km)", min_value=0.1, format="%.2f")
 
-col5, col6 = st.columns([3, 1])
-addr3 = col5.text_input("Adresse 3")
-dist3 = col6.number_input("Dist 3 (km)", min_value=0.1, format="%.2f")
+c5, c6 = st.columns([3, 1])
+a3 = c5.text_input("Adresse 3")
+d3 = c6.number_input("Dist 3 (km)", min_value=0.1, format="%.2f")
 
-# --- ACTION ---
+# --- EXECUTION ---
 if st.button("LANCER LA TRIANGULATION"):
-    if addr1 and addr2 and addr3 and dist1 > 0 and dist2 > 0 and dist3 > 0:
-        with st.spinner('Triangulation satellite en cours...'):
-            c1 = get_coords(addr1)
-            c2 = get_coords(addr2)
-            c3 = get_coords(addr3)
+    if a1 and a2 and a3 and d1 and d2 and d3:
+        with st.spinner('Calcul scientifique de la position...'):
+            p1 = get_coords(a1)
+            p2 = get_coords(a2)
+            p3 = get_coords(a3)
 
-            if c1 and c2 and c3:
-                final_pos = trilateration_optimize(c1, dist1, c2, dist2, c3, dist3)
+            if p1 and p2 and p3:
+                # Appel du solveur SciPy
+                final_pos = solve_trilateration(p1, d1, p2, d2, p3, d3)
                 
                 st.session_state.resultat = final_pos
                 st.session_state.marge_erreur = marge
-                st.session_state.coords_points = [(c1, dist1), (c2, dist2), (c3, dist3)]
+                st.session_state.coords_points = [(p1, d1), (p2, d2), (p3, d3)]
             else:
-                st.error("Une adresse est introuvable.")
+                st.error("Adresse introuvable.")
     else:
-        st.warning("Remplissez tout.")
+        st.warning("Données manquantes")
 
-# --- AFFICHAGE CARTE MAPBOX ---
+# --- CARTE 3D (VUE DRONE) ---
 if st.session_state.resultat is not None:
     res = st.session_state.resultat
-    points = st.session_state.coords_points
-    marge_actuelle = st.session_state.marge_erreur
+    pts = st.session_state.coords_points
+    m_err = st.session_state.marge_erreur
     
-    st.success(f"📍 Cible localisée : {res[0]:.5f}, {res[1]:.5f}")
+    st.success(f"📍 Cible : {res[0]:.5f}, {res[1]:.5f}")
     
-    # Configuration Mapbox
-    # Si le token n'est pas trouvé (local sans secrets), on utilise OpenStreetMap par défaut pour éviter le crash
+    # SETUP MAPBOX SATELLITE 3D
+    # Si pas de token, fallback sur OpenStreetMap
+    tile_layer = "OpenStreetMap"
+    attr = "OSM"
+    
     if "MAPBOX_TOKEN" in st.secrets:
-        mapbox_token = st.secrets["MAPBOX_TOKEN"]
-        
-        # STYLE SATELLITE (Tactique) :
-        tiles_url = f"https://api.mapbox.com/styles/v1/mapbox/satellite-streets-v12/tiles/{{z}}/{{x}}/{{y}}?access_token={mapbox_token}"
-        
-        # SI TU VEUX LE STYLE DARK (Hades), décommente cette ligne et commente celle du dessus :
-        # tiles_url = f"https://api.mapbox.com/styles/v1/mapbox/dark-v11/tiles/{{z}}/{{x}}/{{y}}?access_token={mapbox_token}"
-        
-        attr = "Mapbox"
-    else:
-        tiles_url = "OpenStreetMap"
-        attr = "OpenStreetMap"
-        st.warning("⚠️ Clé Mapbox non trouvée dans les secrets. Affichage standard.")
-
+        token = st.secrets["MAPBOX_TOKEN"]
+        # Utilisation des tuiles Satellite
+        tile_layer = f"https://api.mapbox.com/styles/v1/mapbox/satellite-streets-v12/tiles/{{z}}/{{x}}/{{y}}?access_token={token}"
+        attr = "Mapbox Satellite"
+    
     # Création de la carte
-    m = folium.Map(location=res, zoom_start=12, tiles=None) # tiles=None car on ajoute le calque manuellement
+    # LOCATION : Centre sur le résultat
+    m = folium.Map(
+        location=res, 
+        zoom_start=14, # Zoom assez proche pour voir l'effet 3D
+        tiles=None,
+        control_scale=True
+    )
     
-    # Ajout du fond de carte Mapbox
-    folium.TileLayer(tiles=tiles_url, attr=attr, name="Mapbox").add_to(m)
-    
-    # Affichage des éléments graphiques
-    for i, (pt, dist) in enumerate(points):
-        # Cercles en BLANC pour bien ressortir sur le satellite
-        r_min = max(0, dist - marge_actuelle) * 1000
-        folium.Circle(pt, radius=r_min, color="white", weight=1, fill=False, opacity=0.5, dash_array='5, 5').add_to(m)
-        
-        r_max = (dist + marge_actuelle) * 1000
-        folium.Circle(pt, radius=r_max, color="white", weight=1, fill=False, opacity=0.5, dash_array='5, 5').add_to(m)
+    # Ajout du fond de carte
+    folium.TileLayer(tiles=tile_layer, attr=attr, name="Satellite").add_to(m)
 
-        folium.Circle(pt, radius=dist*1000, color="#00FFFF", weight=2, fill=False).add_to(m) # Cyan néon
-        folium.Marker(pt, tooltip=f"Point {i+1}", icon=folium.Icon(color="blue", icon="map-marker")).add_to(m)
-    
-    folium.Circle(res, radius=marge_actuelle*1000, color="#FF3333", fill=True, fill_opacity=0.4).add_to(m)
+    # --- ÉLÉMENTS GRAPHIQUES ---
+    for pt, dist in pts:
+        # Cercles de marge (Pointillés blancs)
+        folium.Circle(pt, radius=(dist-m_err)*1000, color="white", weight=1, dash_array='5,5', fill=False, opacity=0.5).add_to(m)
+        folium.Circle(pt, radius=(dist+m_err)*1000, color="white", weight=1, dash_array='5,5', fill=False, opacity=0.5).add_to(m)
+        
+        # Cercle exact (Cyan)
+        folium.Circle(pt, radius=dist*1000, color="#00FFFF", weight=2, fill=False).add_to(m)
+
+    # CIBLE (Rouge)
+    folium.Circle(res, radius=m_err*1000, color="#FF0000", fill=True, fill_opacity=0.3).add_to(m)
     folium.Marker(res, icon=folium.Icon(color="red", icon="crosshairs", prefix="fa")).add_to(m)
 
-    st_folium(m, width=700)
+    # --- EFFET 3D ---
+    # C'est ici que la magie opère : on force l'inclinaison (pitch) via JavaScript
+    # Car Folium python ne l'expose pas directement facilement
+    m.get_root().html.add_child(folium.Element("""
+        <script>
+            document.addEventListener('DOMContentLoaded', function() {
+                var map_instance = %s;
+                // On force l'inclinaison à 60 degrés (Vue Drone)
+                map_instance.getMap().setPitch(60);
+                map_instance.getMap().setBearing(0);
+            });
+        </script>
+    """ % m.get_name()))
+
+    st_folium(m, width=700, height=500)
