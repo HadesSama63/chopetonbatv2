@@ -2,7 +2,7 @@ import streamlit as st
 import folium
 from streamlit_folium import st_folium
 from geopy.geocoders import Nominatim
-from scipy.optimize import minimize
+from scipy.optimize import least_squares
 import math
 from PIL import Image
 import numpy as np
@@ -37,54 +37,64 @@ with col_logo:
     except:
         pass
 with col_title:
-    st.title("Chope ton Bat Ultimate Edition")
-st.markdown("### Système de Triangulation Tactique (Moteur SciPy)")
+    st.title("Chope ton Bat Ultimate")
+st.markdown("### Système de Triangulation (Ultimate 3D)")
 
-# --- MOTEUR MATHÉMATIQUE SCIENTIFIQUE ---
+# --- MOTEUR MATHÉMATIQUE PRO (MOINDRES CARRÉS) ---
 
-def earth_dist(lat1, lon1, lat2, lon2):
-    """Distance précise sur une sphère (Haversine) pour l'optimiseur"""
-    R = 6371
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlambda = math.radians(lon2 - lon1)
-    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
-    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+def haversine_np(lon1, lat1, lon2, lat2):
+    """
+    Calcule la distance Haversine de manière vectorisée (compatible numpy)
+    """
+    lon1, lat1, lon2, lat2 = map(np.radians, [lon1, lat1, lon2, lat2])
+    dlon = lon2 - lon1
+    dlat = lat2 - lat1
+    a = np.sin(dlat/2.0)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon/2.0)**2
+    c = 2 * np.arcsin(np.sqrt(a))
+    km = 6371 * c
+    return km
 
-def error_function(guess, points, radii):
-    """Fonction que l'IA doit réduire à 0"""
-    lat, lon = guess
-    err = 0
-    for i in range(3):
-        # On calcule la différence entre la distance réelle et le rayon voulu
-        dist_calc = earth_dist(lat, lon, points[i][0], points[i][1])
-        err += (dist_calc - radii[i])**2
-    return err
+def residuals(guess, points, radii):
+    """
+    Fonction de résidus pour least_squares.
+    Calcule la différence entre la distance actuelle et le rayon cible pour chaque point.
+    L'optimiseur cherche à rendre ces différences aussi proches de 0 que possible.
+    """
+    lat_guess, lon_guess = guess
+    res = []
+    for i in range(len(points)):
+        # points[i] est (lat, lon)
+        dist_calc = haversine_np(lon_guess, lat_guess, points[i][1], points[i][0])
+        # On veut que (distance calculée - rayon donné) soit = 0
+        res.append(dist_calc - radii[i])
+    return np.array(res)
 
-def solve_trilateration(p1, r1, p2, r2, p3, r3):
-    # 1. Point de départ intelligent (Barycentre pondéré)
-    # On démarre la recherche au milieu des 3 points
-    initial_guess = [
-        (p1[0] + p2[0] + p3[0]) / 3,
-        (p1[1] + p2[1] + p3[1]) / 3
-    ]
-    
+def solve_trilateration_robust(p1, r1, p2, r2, p3, r3):
     points = [p1, p2, p3]
     radii = [r1, r2, r3]
+    
+    # 1. Point de départ approximatif (moyenne simple)
+    initial_guess = [
+        np.mean([p[0] for p in points]),
+        np.mean([p[1] for p in points])
+    ]
 
-    # 2. Résolution par méthode de Nelder-Mead (Robuste pour la géométrie non-linéaire)
-    result = minimize(
-        error_function, 
+    # 2. Résolution par Moindres Carrés Non-Linéaires (Trust Region Reflective)
+    # C'est la méthode la plus robuste pour ce type de problème géométrique.
+    result = least_squares(
+        residuals, 
         initial_guess, 
         args=(points, radii),
-        method='Nelder-Mead',
-        tol=1e-6
+        method='trf', # Très robuste pour les problèmes bornés
+        loss='soft_l1', # Résistant aux données aberrantes
+        ftol=1e-8,
+        xtol=1e-8
     )
     
     return result.x[0], result.x[1]
 
 def get_coords(address):
-    geolocator = Nominatim(user_agent="triangulation_app_hades_final")
+    geolocator = Nominatim(user_agent="triangulation_app_hades_pro")
     try:
         location = geolocator.geocode(address, timeout=10)
         return (location.latitude, location.longitude) if location else None
@@ -110,14 +120,14 @@ d3 = c6.number_input("Dist 3 (km)", min_value=0.1, format="%.2f")
 # --- EXECUTION ---
 if st.button("LANCER LA TRIANGULATION"):
     if a1 and a2 and a3 and d1 and d2 and d3:
-        with st.spinner('Calcul scientifique de la position...'):
+        with st.spinner('Calcul de convergence optimal...'):
             p1 = get_coords(a1)
             p2 = get_coords(a2)
             p3 = get_coords(a3)
 
             if p1 and p2 and p3:
-                # Appel du solveur SciPy
-                final_pos = solve_trilateration(p1, d1, p2, d2, p3, d3)
+                # Appel du solveur robuste
+                final_pos = solve_trilateration_robust(p1, d1, p2, d2, p3, d3)
                 
                 st.session_state.resultat = final_pos
                 st.session_state.marge_erreur = marge
@@ -127,59 +137,58 @@ if st.button("LANCER LA TRIANGULATION"):
     else:
         st.warning("Données manquantes")
 
-# --- CARTE 3D (VUE DRONE) ---
+# --- CARTE VECTEUR 3D ---
 if st.session_state.resultat is not None:
     res = st.session_state.resultat
     pts = st.session_state.coords_points
     m_err = st.session_state.marge_erreur
     
-    st.success(f"📍 Cible : {res[0]:.5f}, {res[1]:.5f}")
+    st.success(f"📍 Point de convergence optimal : {res[0]:.5f}, {res[1]:.5f}")
     
-    # SETUP MAPBOX SATELLITE 3D
-    # Si pas de token, fallback sur OpenStreetMap
+    # SETUP MAPBOX VECTOR
     tile_layer = "OpenStreetMap"
     attr = "OSM"
     
     if "MAPBOX_TOKEN" in st.secrets:
         token = st.secrets["MAPBOX_TOKEN"]
-        # Utilisation des tuiles Satellite
-        tile_layer = f"https://api.mapbox.com/styles/v1/mapbox/satellite-streets-v12/tiles/{{z}}/{{x}}/{{y}}?access_token={token}"
-        attr = "Mapbox Satellite"
+        # Utilisation du style "Streets" vectoriel (très propre) au lieu du satellite
+        tile_layer = f"https://api.mapbox.com/styles/v1/mapbox/streets-v12/tiles/{{z}}/{{x}}/{{y}}?access_token={token}"
+        attr = "Mapbox Streets"
     
     # Création de la carte
-    # LOCATION : Centre sur le résultat
     m = folium.Map(
         location=res, 
-        zoom_start=14, # Zoom assez proche pour voir l'effet 3D
+        zoom_start=13,
         tiles=None,
         control_scale=True
     )
     
-    # Ajout du fond de carte
-    folium.TileLayer(tiles=tile_layer, attr=attr, name="Satellite").add_to(m)
+    folium.TileLayer(tiles=tile_layer, attr=attr, name="Vector Map", detect_retina=True).add_to(m)
 
     # --- ÉLÉMENTS GRAPHIQUES ---
-    for pt, dist in pts:
-        # Cercles de marge (Pointillés blancs)
-        folium.Circle(pt, radius=(dist-m_err)*1000, color="white", weight=1, dash_array='5,5', fill=False, opacity=0.5).add_to(m)
-        folium.Circle(pt, radius=(dist+m_err)*1000, color="white", weight=1, dash_array='5,5', fill=False, opacity=0.5).add_to(m)
+    for i, (pt, dist) in enumerate(pts):
+        # Marge (Pointillés Gris)
+        folium.Circle(pt, radius=(dist-m_err)*1000, color="#555555", weight=1, dash_array='5,5', fill=False, opacity=0.6).add_to(m)
+        folium.Circle(pt, radius=(dist+m_err)*1000, color="#555555", weight=1, dash_array='5,5', fill=False, opacity=0.6).add_to(m)
         
-        # Cercle exact (Cyan)
-        folium.Circle(pt, radius=dist*1000, color="#00FFFF", weight=2, fill=False).add_to(m)
+        # Cercle exact (Bleu vif)
+        folium.Circle(pt, radius=dist*1000, color="#007cbf", weight=2, fill=False).add_to(m)
+        # Marqueur numéroté
+        folium.Marker(pt, icon=folium.DivIcon(html=f"""<div style="font-family: sans-serif; color: white; background-color: #007cbf; width: 20px; height: 20px; border-radius: 50%; text-align: center; line-height: 20px;">{i+1}</div>""")).add_to(m)
 
-    # CIBLE (Rouge)
-    folium.Circle(res, radius=m_err*1000, color="#FF0000", fill=True, fill_opacity=0.3).add_to(m)
+
+    # CIBLE (Rouge vif avec halo)
+    folium.Circle(res, radius=m_err*1000, color="red", weight=1, fill=True, fill_color="#ff0000", fill_opacity=0.2).add_to(m)
     folium.Marker(res, icon=folium.Icon(color="red", icon="crosshairs", prefix="fa")).add_to(m)
 
-    # --- EFFET 3D ---
-    # C'est ici que la magie opère : on force l'inclinaison (pitch) via JavaScript
-    # Car Folium python ne l'expose pas directement facilement
+    # --- EFFET 3D (Inclinaison forcée) ---
     m.get_root().html.add_child(folium.Element("""
         <script>
             document.addEventListener('DOMContentLoaded', function() {
                 var map_instance = %s;
-                // On force l'inclinaison à 60 degrés (Vue Drone)
-                map_instance.getMap().setPitch(60);
+                // Inclinaison à 55 degrés pour l'effet 3D
+                map_instance.getMap().setPitch(55);
+                // Orientation vers le Nord
                 map_instance.getMap().setBearing(0);
             });
         </script>
