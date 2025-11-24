@@ -2,7 +2,7 @@ import streamlit as st
 import folium
 from streamlit_folium import st_folium
 from geopy.geocoders import Nominatim
-from scipy.optimize import differential_evolution
+from scipy.optimize import minimize
 import math
 from PIL import Image
 import numpy as np
@@ -38,12 +38,12 @@ with col_logo:
         pass
 with col_title:
     st.title("Chope ton Bat")
-st.markdown("### Système de Triangulation (Moteur Ultimate)")
+st.markdown("### Système de Triangulation (Ultimate)")
 
-# --- MOTEUR MATHÉMATIQUE GLOBAL (EVOLUTION DIFFÉRENTIELLE) ---
+# --- MOTEUR MATHÉMATIQUE "MARGE-AWARE" ---
 
 def haversine_scalar(lat1, lon1, lat2, lon2):
-    """Distance précise sur une sphère (Haversine)"""
+    """Distance précise sur une sphère (km)"""
     R = 6371
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
@@ -51,60 +51,55 @@ def haversine_scalar(lat1, lon1, lat2, lon2):
     a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
 
-def error_function_global(coords, points, radii):
+def cost_function_zones(coords, points, radii, margin):
     """
-    Fonction d'erreur pour l'évolution différentielle.
-    coords: [lat, lon] candidat
+    C'est ici que la magie opère.
+    Au lieu de pénaliser la distance exacte, on pénalise seulement
+    si on est SORTI de la zone (Rayon +/- Marge).
     """
     lat, lon = coords
-    total_error = 0
+    total_penalty = 0
     
     for i in range(len(points)):
-        p_lat, p_lon = points[i]
-        target_radius = radii[i]
+        target_dist = radii[i]
+        actual_dist = haversine_scalar(lat, lon, points[i][0], points[i][1])
         
-        # Distance calculée entre le point testé et l'antenne
-        dist = haversine_scalar(lat, lon, p_lat, p_lon)
+        # On calcule l'écart absolu par rapport au rayon idéal
+        deviation = abs(actual_dist - target_dist)
         
-        # On ajoute l'erreur au carré
-        total_error += (dist - target_radius)**2
+        # Si l'écart est plus petit que la marge, le coût est 0 (on est dans la zone verte)
+        # Sinon, le coût augmente
+        penalty = max(0, deviation - margin)
         
-    return total_error
+        # On met au carré pour punir sévèrement les grands écarts
+        total_penalty += penalty**2
+        
+    return total_penalty
 
-def solve_trilateration_global(p1, r1, p2, r2, p3, r3):
+def solve_trilateration_zones(p1, r1, p2, r2, p3, r3, margin):
     points = [p1, p2, p3]
     radii = [r1, r2, r3]
     
-    # 1. Définir la ZONE DE RECHERCHE (Bounding Box)
-    # On prend les lats/lons min et max des points et on ajoute une marge
-    # pour être sûr que l'intersection est dedans.
-    lats = [p[0] for p in points]
-    lons = [p[1] for p in points]
-    max_dist = max(radii) * 2 / 111.0 # Conversion approx km vers degrés pour la marge
-    
-    bounds = [
-        (min(lats) - max_dist, max(lats) + max_dist), # Latitude min/max
-        (min(lons) - max_dist, max(lons) + max_dist)  # Longitude min/max
+    # 1. Point de départ : Barycentre géométrique
+    initial_guess = [
+        np.mean([p[0] for p in points]),
+        np.mean([p[1] for p in points])
     ]
 
-    # 2. Algorithme d'Évolution Différentielle
-    # Il "parachutes" des points partout dans la zone et fait survivre les meilleurs.
-    result = differential_evolution(
-        error_function_global,
-        bounds,
-        args=(points, radii),
-        strategy='best1bin',
-        maxiter=1000,
-        popsize=15,
-        tol=1e-7,
-        mutation=(0.5, 1),
-        recombination=0.7
+    # 2. Minimisation de la fonction de coût "Zones"
+    # On utilise Nelder-Mead car la fonction cost_function_zones n'est pas lisse (à cause du max(0, ...))
+    result = minimize(
+        cost_function_zones,
+        initial_guess,
+        args=(points, radii, margin),
+        method='Nelder-Mead',
+        tol=1e-7
     )
     
     return result.x[0], result.x[1]
 
 def get_coords(address):
-    geolocator = Nominatim(user_agent="triangulation_app_hades_evo")
+    geolocator = Nominatim(user_agent="triangulation_app_hades_zones")
     try:
         location = geolocator.geocode(address, timeout=10)
         return (location.latitude, location.longitude) if location else None
@@ -112,8 +107,9 @@ def get_coords(address):
         return None
 
 # --- UI ---
-st.markdown("#### Paramètres")
-marge = st.slider("Marge d'erreur visuelle (km)", 0.1, 10.0, 1.0, 0.1)
+st.markdown("#### Paramètres Tactiques")
+# Le slider définit maintenant la "Zone de vérité"
+marge = st.slider("Marge d'erreur / Épaisseur de zone (km)", 0.1, 10.0, 1.0, 0.1)
 
 c1, c2 = st.columns([3, 1])
 a1 = c1.text_input("Adresse 1")
@@ -130,14 +126,14 @@ d3 = c6.number_input("Dist 3 (km)", min_value=0.1, format="%.2f")
 # --- EXECUTION ---
 if st.button("LANCER LA TRIANGULATION"):
     if a1 and a2 and a3 and d1 and d2 and d3:
-        with st.spinner('Scan global de la zone (Differential Evolution)...'):
+        with st.spinner('Recherche de l\'intersection des zones...'):
             p1 = get_coords(a1)
             p2 = get_coords(a2)
             p3 = get_coords(a3)
 
             if p1 and p2 and p3:
-                # Appel du solveur global
-                final_pos = solve_trilateration_global(p1, d1, p2, d2, p3, d3)
+                # On passe la marge à la fonction de résolution
+                final_pos = solve_trilateration_zones(p1, d1, p2, d2, p3, d3, marge)
                 
                 st.session_state.resultat = final_pos
                 st.session_state.marge_erreur = marge
@@ -153,44 +149,36 @@ if st.session_state.resultat is not None:
     pts = st.session_state.coords_points
     m_err = st.session_state.marge_erreur
     
-    st.success(f"📍 Meilleure convergence trouvée : {res[0]:.5f}, {res[1]:.5f}")
+    st.success(f"📍 Zone d'intersection optimale : {res[0]:.5f}, {res[1]:.5f}")
     
-    # SETUP MAPBOX VECTOR
+    # SETUP MAPBOX
     tile_layer = "OpenStreetMap"
     attr = "OSM"
-    
     if "MAPBOX_TOKEN" in st.secrets:
         token = st.secrets["MAPBOX_TOKEN"]
-        # Style Vectoriel Streets
         tile_layer = f"https://api.mapbox.com/styles/v1/mapbox/streets-v12/tiles/{{z}}/{{x}}/{{y}}?access_token={token}"
         attr = "Mapbox Streets"
     
-    # Création de la carte
-    m = folium.Map(
-        location=res, 
-        zoom_start=13,
-        tiles=None,
-        control_scale=True
-    )
-    
-    folium.TileLayer(tiles=tile_layer, attr=attr, name="Vector Map", detect_retina=True).add_to(m)
+    # Carte centrée
+    m = folium.Map(location=res, zoom_start=13, tiles=None, control_scale=True)
+    folium.TileLayer(tiles=tile_layer, attr=attr, detect_retina=True).add_to(m)
 
     # --- ÉLÉMENTS GRAPHIQUES ---
     for i, (pt, dist) in enumerate(pts):
-        # Marge (Gris)
-        folium.Circle(pt, radius=(dist-m_err)*1000, color="#666", weight=1, dash_array='5,5', fill=False, opacity=0.5).add_to(m)
-        folium.Circle(pt, radius=(dist+m_err)*1000, color="#666", weight=1, dash_array='5,5', fill=False, opacity=0.5).add_to(m)
+        # On dessine la ZONE (La bande de tolérance)
+        # Cercle Extérieur (Gris foncé)
+        folium.Circle(pt, radius=(dist + m_err)*1000, color="#666", weight=1, dash_array='5,5', fill=False).add_to(m)
+        # Cercle Intérieur (Gris foncé)
+        folium.Circle(pt, radius=max(0, dist - m_err)*1000, color="#666", weight=1, dash_array='5,5', fill=False).add_to(m)
         
-        # Cercle exact (Bleu)
-        folium.Circle(pt, radius=dist*1000, color="#2196F3", weight=2, fill=False).add_to(m)
+        # La ligne théorique (Bleue)
+        folium.Circle(pt, radius=dist*1000, color="#2196F3", weight=2, fill=False, opacity=0.6).add_to(m)
         
-        # Marqueur
-        folium.Marker(pt, tooltip=f"Repère {i+1}").add_to(m)
+        folium.Marker(pt, tooltip=f"Point {i+1}").add_to(m)
 
-
-    # CIBLE (Rouge avec Pulsation simulée par 2 cercles)
+    # CIBLE (Rouge)
+    # Le rayon rouge correspond maintenant visuellement à la marge d'erreur
     folium.Circle(res, radius=m_err*1000, color="red", weight=1, fill=True, fill_color="#ff0000", fill_opacity=0.3).add_to(m)
-    folium.Circle(res, radius=(m_err*1000)/3, color="red", weight=2, fill=True, fill_color="#ff0000", fill_opacity=0.8).add_to(m)
     folium.Marker(res, icon=folium.Icon(color="red", icon="crosshairs", prefix="fa")).add_to(m)
 
     # --- EFFET 3D ---
@@ -198,7 +186,7 @@ if st.session_state.resultat is not None:
         <script>
             document.addEventListener('DOMContentLoaded', function() {
                 var map_instance = %s;
-                map_instance.getMap().setPitch(60); // Inclinaison max
+                map_instance.getMap().setPitch(60);
                 map_instance.getMap().setBearing(0);
             });
         </script>
